@@ -69,12 +69,26 @@ def load_schema_wrap(path: str, **kwargs):
     schema: SchemaDefinition
     schema = yaml_loader.load(path, target_class=SchemaDefinition, **kwargs)
     if "\n" not in path:
-        # only set path if the input is not a yaml string.
+    # if "\n" not in path and "://" not in path:
+        # only set path if the input is not a yaml string or URL.
         # Setting the source path is necessary for relative imports;
         # while initializing a schema with a yaml string is possible, there
         # should be no expectation of relative imports working.
         schema.source_file = path
     return schema
+
+
+def is_absolute_path(path: str) -> bool:
+    if path.startswith("/"):
+        return True
+    # windows
+    if not os.path.isabs(path):
+        return False
+    norm_path = os.path.normpath(path)
+    if norm_path.startswith("\\\\") or ":" not in norm_path:
+        return False
+    drive, tail = os.path.splitdrive(norm_path)
+    return bool(drive and tail)
 
 
 @dataclass
@@ -169,6 +183,9 @@ class SchemaView(object):
         In future, this mechanism may be extended to arbitrary modules, such that we avoid
         network dependence at runtime in general.
 
+        For local paths, the import is resolved relative to the directory containing the source file,
+        or the URL of the source file, if it is a URL.
+
         :param imp:
         :param from_schema:
         :return:
@@ -181,10 +198,12 @@ class SchemaView(object):
         }
         importmap = {**default_import_map, **self.importmap}
         sname = map_import(importmap, self.namespaces, imp)
-        logging.info(f'Importing {imp} as {sname} from source {from_schema.source_file}')
-        schema = load_schema_wrap(sname + '.yaml',
-                                  base_dir=os.path.dirname(
-                                  from_schema.source_file) if from_schema.source_file else None)
+        if from_schema.source_file and not is_absolute_path(sname):
+            base_dir = os.path.dirname(from_schema.source_file)
+        else:
+            base_dir = None
+        logging.info(f'Importing {imp} as {sname} from source {from_schema.source_file}; base_dir={base_dir}')
+        schema = load_schema_wrap(sname + '.yaml', base_dir=base_dir)
         return schema
 
     @lru_cache()
@@ -1223,6 +1242,8 @@ class SchemaView(object):
                 setattr(induced_slot, metaslot_name, v)
         if slot.inlined_as_list:
             slot.inlined = True
+        if slot.identifier or slot.key:
+            slot.required = True
         if mangle_name:
             mangled_name = f'{camelcase(class_name)}__{underscore(slot_name)}'
             induced_slot.name = mangled_name
@@ -1230,7 +1251,8 @@ class SchemaView(object):
             induced_slot.alias = underscore(slot_name)
         for c in self.all_classes().values():
             if induced_slot.name in c.slots or induced_slot.name in c.attributes:
-                induced_slot.domain_of.append(c.name)
+                if c.name not in induced_slot.domain_of:
+                    induced_slot.domain_of.append(c.name)
         return deepcopy(induced_slot)
 
     @lru_cache()
@@ -1452,21 +1474,20 @@ class SchemaView(object):
                         enum_slots.append(slot_definition)
         return enum_slots
 
-    def get_classes_modifying_slot(self, slot_name: SLOT_NAME = None) -> List[ClassDefinition]:
+    def get_classes_modifying_slot(self, slot: SlotDefinition) -> List[ClassDefinition]:
         """Get all ClassDefinitions that modify a given slot.
 
         :param slot_name: slot in consideration
         :return: list of ClassDefinitions modifying the slot of interest
         """
-        # slot_classes = [c for c in self.all_classes().values() if c.slot_usage == slot_name]
-        # slot_classes = [c for c in self.all_classes().values()]
-        slot_classes = []
+        modifying_classes = []
         for class_definition in self.all_classes().values():
             if class_definition.slot_usage:
                 for slot_definition in class_definition.slot_usage.values():
-                    if slot_definition.name == slot_name:
-                        slot_classes.append(class_definition)
-        return slot_classes
+                    if slot_definition.name == slot.name:
+                        modifying_classes.append(class_definition.name)
+
+        return modifying_classes
 
     def is_slot_percent_encoded(self, slot: SlotDefinitionName) -> bool:
         """
@@ -1592,7 +1613,7 @@ class SchemaView(object):
         :param type_name: type to be deleted
         :return:
         """
-        del self.schema.typees[type_name]
+        del self.schema.types[type_name]
         self.set_modified()
 
     def delete_subset(self, subset_name: SubsetDefinitionName) -> None:
@@ -1686,7 +1707,7 @@ class SchemaView(object):
 
     def materialize_derived_schema(self) -> SchemaDefinition:
         """ Materialize a schema view into a schema definition """
-        derived_schema = copy(self.schema)
+        derived_schema = deepcopy(self.schema)
         derived_schemaview = SchemaView(derived_schema)
         derived_schemaview.merge_imports()
         for typ in [deepcopy(t) for t in self.all_types().values()]:
